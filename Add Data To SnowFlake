@@ -1,0 +1,549 @@
+<div align="center">
+
+# ❄️ NPPES → Snowflake Load Guide
+
+**Load the national provider registry (NPPES) into Snowflake and turn it into a clean `NPI → specialty` lookup for Medicaid peer-group analysis.**
+
+![Snowflake](https://img.shields.io/badge/Snowflake-29B5E8?style=for-the-badge&logo=snowflake&logoColor=white)
+![PowerShell](https://img.shields.io/badge/PowerShell-5391FE?style=for-the-badge&logo=powershell&logoColor=white)
+![Source](https://img.shields.io/badge/CMS%20%2F%20NUCC-informational?style=for-the-badge)
+![Rows](https://img.shields.io/badge/9.6M%20rows-success?style=for-the-badge)
+
+<sub>Built for a **browser-only** Snowflake environment — no CLI, no connectors.</sub>
+
+</div>
+
+---
+
+## 📑 Contents
+
+1. [What you end up with](#-what-you-end-up-with)
+2. [The pipeline at a glance](#️-the-pipeline-at-a-glance)
+3. [Key concepts in plain terms](#-key-concepts-in-plain-terms)
+4. [Before you start](#-before-you-start)
+5. [Step 1 — Download NPPES](#1️⃣-step-1--download-nppes)
+6. [Step 2 — Split + zip on your PC](#2️⃣-step-2--split--zip-on-your-pc)
+7. [Step 3 — Set up Snowflake](#3️⃣-step-3--set-up-snowflake-run-once)
+8. [Step 4 — Upload the parts](#4️⃣-step-4--upload-the-parts)
+9. [Step 5 — Build the wide table](#5️⃣-step-5--build-the-wide-table)
+10. [Step 6 — Load the data](#6️⃣-step-6--load-the-data)
+11. [Step 7 — Make the NPI → specialty lookup](#7️⃣-step-7--make-the-npi--specialty-lookup)
+12. [Step 8 — Add plain-English names](#8️⃣-step-8--add-plain-english-specialty-names-nucc)
+13. [Step 9 — Final sanity checks](#9️⃣-step-9--final-sanity-checks)
+14. [What's next — join to claims](#-whats-next--join-to-the-claims-data)
+15. [Refreshing next month](#-refreshing-next-month)
+16. [Troubleshooting](#-troubleshooting)
+17. [Glossary](#-glossary)
+18. [Sources](#-sources)
+
+---
+
+## 📦 What you end up with
+
+| Table | What it is | One row per… |
+| --- | --- | --- |
+| `MEDICAID.REF.NPPES_RAW` | The full provider file, all 330 columns, untouched | Provider (~9.6M) |
+| `MEDICAID.REF.NUCC_TAXONOMY` | Code → specialty-name dictionary | Taxonomy code (~880) |
+| **`MEDICAID.REF.NPI_TAXONOMY_NAMED`** | **The finished lookup** — NPI + specialty code + plain name | NPI |
+
+`NPI_TAXONOMY_NAMED` is the one you join to billing NPIs. The other two are the raw source (a backup) and the dictionary that feeds the names.
+
+---
+
+## 🗺️ The pipeline at a glance
+
+```mermaid
+flowchart TD
+    subgraph PC["💻 On your PC"]
+        A[Download NPPES V.2 zip] --> B[Unzip → find npidata_pfile]
+        B --> C[Split into ~240 MB parts<br/>header in EVERY part]
+        C --> D[Gzip each part with 7-Zip]
+    end
+    subgraph SF["❄️ In Snowflake"]
+        E[Upload parts to NPPES_STAGE] --> F[INFER_SCHEMA builds NPPES_RAW]
+        F --> G[COPY INTO • ~9.6M rows]
+        G --> H[Derive NPI_TAXONOMY<br/>primary specialty per NPI]
+        H --> I[Load NUCC crosswalk<br/>into NUCC_TAXONOMY]
+        I --> J[Join into NPI_TAXONOMY_NAMED]
+    end
+    D --> E
+    J --> K[(Join to MEDICAID_SPENDING<br/>on billing NPI)]
+```
+
+**On your PC:** get the file small enough to upload through a browser.
+**In Snowflake:** load it, then boil 330 columns down to the 2 you actually need.
+
+---
+
+## 🧠 Key concepts in plain terms
+
+| Term | Plain meaning |
+| --- | --- |
+| **Database** | The biggest container. Yours is `MEDICAID`. |
+| **Schema** | A folder inside the database. Reference tables go in `REF`. |
+| **Table** | A single dataset (rows and columns), like `NPPES_RAW`. |
+| **Full address** | `DATABASE.SCHEMA.TABLE` — a folder path, e.g. `MEDICAID.REF.NPPES_RAW`. |
+| **Stage** | A holding area you upload files into *before* loading them into a table. |
+| **File format** | The rules for reading a CSV — where quotes are, whether there's a header, etc. |
+| **`INFER_SCHEMA`** | Snowflake reads the header row and builds all the columns for you. |
+| **`COPY INTO`** | The command that actually loads the staged files into a table. |
+| **`MATCH_BY_COLUMN_NAME`** | Lines up file columns to table columns **by name**, so order doesn't matter. |
+| **NPI** | A provider's 10-digit national ID number. |
+| **Taxonomy code** | A 10-character code for a specialty (e.g. `207Q00000X` = Family Medicine). |
+
+> [!NOTE]
+> **Why split the file?** The browser upload has a **250 MB** limit per file. The raw CSV is ~10 GB, so it must be broken into pieces.
+>
+> **Why gzip?** Gzip shrinks each part from ~240 MB to ~22 MB. Snowflake reads gzip natively, so uploads are ~10× smaller and faster with zero downside.
+
+---
+
+## 🧰 Before you start
+
+- **Snowflake access** to database `MEDICAID`, with rights to create a schema, stage, and tables.
+- **7-Zip** installed → `https://www.7-zip.org`
+- **PowerShell** (built into Windows).
+- **~15 GB free disk** — the raw CSV is large before you gzip it.
+- A **running warehouse** in Snowflake (the `COPY INTO` needs compute to run).
+
+---
+
+## 1️⃣ Step 1 — Download NPPES
+
+Get the monthly **NPPES Data Dissemination** file (Version 2) from CMS:
+
+🔗 **`https://download.cms.gov/nppes/NPI_Files.html`**
+
+- It's a ~1 GB zip that unzips to a ~10 GB CSV (~9.6M rows, 330 columns).
+- Download the **"NPPES Data Dissemination"** file (the full monthly one, **V.2**).
+
+**Unzip it**, then find the right file. The zip has several files — you only want the **big data file**, whose name looks like:
+
+```
+npidata_pfile_20050523-20260608.csv
+```
+
+Ignore the others:
+
+- `..._FileHeader.csv` — just the header row (the big file already has its own header)
+- `endpoint_pfile_*.csv`, `othername_pfile_*.csv`, `pl_pfile_*.csv` — extra data you don't need here
+
+Quick way to find the one file, ignoring the header file:
+
+```powershell
+Get-ChildItem "C:\path\to\NPPES_unzipped\npidata_pfile_*.csv" |
+    Where-Object { $_.Name -notlike "*FileHeader*" }
+```
+
+---
+
+## 2️⃣ Step 2 — Split + zip on your PC
+
+**Goal:** turn the one giant CSV into many small `.csv.gz` parts, each with the header row, ready to upload.
+
+> [!WARNING]
+> **Do this in a normal local folder** (e.g. `Downloads`), **not** in OneDrive. OneDrive tries to sync every part as it's written, which throttles the whole job and locks files.
+
+### 2a. Split the file
+
+Reads the big CSV line by line and writes ~240 MB parts, copying the **header row into every part**. (NPPES puts one record per line, so splitting on line boundaries is safe.)
+
+> [!IMPORTANT]
+> The header **must** be in every part. Snowflake reads the first line of *each* file as the header — if a part is missing it, that part's first real row gets dropped and the columns won't line up.
+
+```powershell
+# ============================================================
+#  NPPES splitter — makes ~240 MB parts, header in each part
+# ============================================================
+
+# ---- CONFIG: edit these three paths ----
+$src      = "C:\path\to\npidata_pfile.csv"                 # the big NPPES CSV
+$outDir   = "C:\Users\<you>\Downloads\NPPES_split250"      # local, NOT OneDrive
+$maxBytes = 240MB                                          # stay under the 250 MB limit
+
+# ---- Setup ----
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+$reader = [System.IO.StreamReader]::new($src)
+$header = $reader.ReadLine()                     # first line = the header (BOM auto-stripped on read)
+$enc    = [System.Text.UTF8Encoding]::new($false)  # write WITHOUT a byte-order mark
+
+$part   = 0
+$writer = $null
+$bytes  = 0
+
+# ---- Main loop ----
+$writer = [System.IO.StreamWriter]::new(
+            (Join-Path $outDir ("NPPES_part{0:D3}.csv" -f (++$part))), $false, $enc)
+$writer.WriteLine($header)
+
+while (($line = $reader.ReadLine()) -ne $null) {
+    if ($bytes -ge $maxBytes) {                 # current part is full → start a new one
+        $writer.Close()
+        $writer = [System.IO.StreamWriter]::new(
+                    (Join-Path $outDir ("NPPES_part{0:D3}.csv" -f (++$part))), $false, $enc)
+        $writer.WriteLine($header)              # header goes in EVERY part
+        $bytes = 0
+    }
+    $writer.WriteLine($line)
+    $bytes += $enc.GetByteCount($line) + 2      # +2 for the line ending
+}
+
+$writer.Close()
+$reader.Close()
+
+Write-Host "Done. Created $part parts in $outDir"
+```
+
+**Result:** `NPPES_part001.csv`, `NPPES_part002.csv`, … each ~240 MB with a header row.
+
+### 2b. Gzip each part, then delete the raw CSVs
+
+```powershell
+$outDir   = "C:\Users\<you>\Downloads\NPPES_split250"
+$sevenZip = "C:\Program Files\7-Zip\7z.exe"
+
+Get-ChildItem $outDir -Filter *.csv | ForEach-Object {
+    Start-Process -FilePath $sevenZip `
+        -ArgumentList "a","-tgzip","$($_.FullName).gz","$($_.FullName)" `
+        -Wait -NoNewWindow                       # -Wait = finish before the next one (avoids file locks)
+    Remove-Item $_.FullName -Force               # delete the raw .csv once it's zipped
+}
+```
+
+> [!CAUTION]
+> **Use 7-Zip, not `Compress-Archive`.** `Compress-Archive` makes a `.zip`, which Snowflake won't auto-detect. You need `.gz` (gzip).
+
+### 2c. If some `.csv` didn't get zipped (locked-file recovery)
+
+If the delete step errors with *"being used by another process"* (antivirus or Explorer preview holding a file), some raw `.csv` files may be left behind. Run this after the main job finishes — it gzips only the ones missing a `.gz`, then deletes the raw files:
+
+```powershell
+cd "C:\Users\<you>\Downloads\NPPES_split250"
+
+Get-ChildItem *.csv | Where-Object { -not (Test-Path "$($_.FullName).gz") } | ForEach-Object {
+    Start-Process -FilePath "C:\Program Files\7-Zip\7z.exe" `
+        -ArgumentList "a","-tgzip","$($_.FullName).gz","$($_.FullName)" `
+        -Wait -NoNewWindow
+}
+Remove-Item *.csv -Force
+```
+
+### 2d. Confirm you're left with only `.gz`
+
+```powershell
+Get-ChildItem "$outDir\*.csv.gz" | Measure-Object   # Count = your number of parts
+Get-ChildItem "$outDir\*.csv"    | Measure-Object   # Count = 0
+```
+
+---
+
+## 3️⃣ Step 3 — Set up Snowflake (run once)
+
+Creates the folder, the upload area, and the CSV-reading rules. You **don't** rebuild these on future refreshes.
+
+```sql
+-- A folder for reference/lookup tables
+CREATE SCHEMA IF NOT EXISTS MEDICAID.REF;
+
+-- The holding area you'll upload files into
+CREATE STAGE  IF NOT EXISTS MEDICAID.REF.NPPES_STAGE;
+
+-- The rules for reading the CSV parts
+CREATE OR REPLACE FILE FORMAT MEDICAID.REF.NPPES_CSV
+  TYPE = CSV
+  PARSE_HEADER = TRUE                 -- use the first row as column names
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'  -- fields are wrapped in double quotes
+  SKIP_BYTE_ORDER_MARK = TRUE         -- ignore the hidden BOM at the file's start
+  ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE;
+```
+
+**Why each line matters:**
+
+- `PARSE_HEADER = TRUE` — lets `INFER_SCHEMA` name all 330 columns, and tells `COPY` to match by header.
+- `FIELD_OPTIONALLY_ENCLOSED_BY = '"'` — NPPES wraps text in quotes (names/addresses contain commas), so fields don't split in the wrong place.
+- `SKIP_BYTE_ORDER_MARK = TRUE` — the file starts with a hidden BOM. Without this, it glues onto the first column name (`NPI`) and every join on NPI silently fails.
+- `ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE` — a safety valve so one odd row can't abort the whole load.
+
+---
+
+## 4️⃣ Step 4 — Upload the parts
+
+In **Snowsight**:
+
+1. Left nav → **Data** → **Databases** → `MEDICAID` → `REF` → **Stages** → `NPPES_STAGE`.
+2. Click **+ Files** (or the Upload button).
+3. Select **all** your `.gz` parts (multi-select). Leave the folder path blank.
+4. Click **Upload**.
+
+Gzip is auto-detected, so there's nothing else to set.
+
+**Confirm every part landed:**
+
+```sql
+LIST @MEDICAID.REF.NPPES_STAGE;
+```
+
+You should see one row per part, all ending in `.csv.gz`, and **no** leftover `.csv`.
+
+---
+
+## 5️⃣ Step 5 — Build the wide table
+
+No hand-typing. Snowflake reads the header of a staged file and builds all 330 columns for you.
+
+```sql
+CREATE OR REPLACE TABLE MEDICAID.REF.NPPES_RAW
+USING TEMPLATE (
+  SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
+  FROM TABLE(
+    INFER_SCHEMA(
+      LOCATION    => '@MEDICAID.REF.NPPES_STAGE',
+      FILE_FORMAT => 'MEDICAID.REF.NPPES_CSV'
+    )
+  )
+);
+```
+
+**What this does:** creates an empty `NPPES_RAW` shaped exactly like the file — all 330 columns, named from the header. No rows yet.
+
+**Peek at the columns (optional):**
+
+```sql
+DESCRIBE TABLE MEDICAID.REF.NPPES_RAW;
+```
+
+Check the first column reads as a clean `NPI` (no hidden characters in front of it).
+
+---
+
+## 6️⃣ Step 6 — Load the data
+
+```sql
+COPY INTO MEDICAID.REF.NPPES_RAW
+FROM @MEDICAID.REF.NPPES_STAGE
+FILE_FORMAT = (FORMAT_NAME = 'MEDICAID.REF.NPPES_CSV')
+MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE   -- match file columns to table columns by name
+ON_ERROR = CONTINUE;                      -- skip a bad row instead of aborting the whole load
+```
+
+**What you'll see:** one result row **per file**. Every file should say status **`LOADED`** with `errors_seen = 0`.
+
+**Confirm the row count:**
+
+```sql
+SELECT COUNT(*) FROM MEDICAID.REF.NPPES_RAW;   -- expect roughly 9,600,000
+```
+
+> [!NOTE]
+> This takes a few minutes on a running warehouse. If it seems stuck, make sure a warehouse is actually running — `COPY` needs compute.
+
+---
+
+## 7️⃣ Step 7 — Make the NPI → specialty lookup
+
+Each provider can list **up to 15** specialties. Exactly one is flagged as their **main** one, marked with a `Y` in a "Primary Taxonomy Switch" column. This grabs that primary specialty (or falls back to the first slot if none is flagged).
+
+```sql
+CREATE OR REPLACE TABLE MEDICAID.REF.NPI_TAXONOMY AS
+SELECT "NPI" AS npi,
+  COALESCE(
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_1"  = 'Y' THEN "Healthcare Provider Taxonomy Code_1"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_2"  = 'Y' THEN "Healthcare Provider Taxonomy Code_2"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_3"  = 'Y' THEN "Healthcare Provider Taxonomy Code_3"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_4"  = 'Y' THEN "Healthcare Provider Taxonomy Code_4"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_5"  = 'Y' THEN "Healthcare Provider Taxonomy Code_5"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_6"  = 'Y' THEN "Healthcare Provider Taxonomy Code_6"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_7"  = 'Y' THEN "Healthcare Provider Taxonomy Code_7"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_8"  = 'Y' THEN "Healthcare Provider Taxonomy Code_8"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_9"  = 'Y' THEN "Healthcare Provider Taxonomy Code_9"  END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_10" = 'Y' THEN "Healthcare Provider Taxonomy Code_10" END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_11" = 'Y' THEN "Healthcare Provider Taxonomy Code_11" END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_12" = 'Y' THEN "Healthcare Provider Taxonomy Code_12" END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_13" = 'Y' THEN "Healthcare Provider Taxonomy Code_13" END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_14" = 'Y' THEN "Healthcare Provider Taxonomy Code_14" END,
+    CASE WHEN "Healthcare Provider Primary Taxonomy Switch_15" = 'Y' THEN "Healthcare Provider Taxonomy Code_15" END,
+    "Healthcare Provider Taxonomy Code_1"     -- fallback: first slot if none flagged Y
+  ) AS specialty
+FROM MEDICAID.REF.NPPES_RAW;
+```
+
+**How `COALESCE` works here:** it returns the **first non-empty** value in the list. Each `CASE` line is empty unless that slot is the primary one, so the first slot marked `Y` wins. If none is flagged, the final line supplies slot 1.
+
+**Check for duplicate NPIs — this MUST return 0:**
+
+```sql
+SELECT COUNT(*) - COUNT(DISTINCT npi) AS dupes
+FROM MEDICAID.REF.NPI_TAXONOMY;
+```
+
+Duplicates would multiply rows when you join to claims later, so this check matters.
+
+---
+
+## 8️⃣ Step 8 — Add plain-English specialty names (NUCC)
+
+Right now `specialty` is a code like `207Q00000X`. The **NUCC taxonomy** file turns it into **"Family Medicine."**
+
+### 8a. Download the NUCC file
+
+`nucc.org` → **Code Sets** tab → **Health Care Provider Taxonomy Code Set** → **CSV**.
+
+> [!CAUTION]
+> Get the **Taxonomy** file (`nucc_taxonomy_260.csv`) — **not** the "Provider Characteristics" file. They have similar names but Characteristics is the wrong list, and it'll leave your specialty names blank.
+
+- You'll click through an AMA permission notice first. That's normal — it's free to use for this kind of analysis.
+- It's small (~880 rows), so **no splitting or gzip** — upload it as-is.
+
+Its columns are: `Code`, `Grouping`, `Classification`, `Specialization`, `Definition`, `Notes`, `Display Name`, `Section`.
+
+### 8b. Load it
+
+```sql
+-- A separate stage keeps this one small file away from the NPPES parts
+CREATE STAGE IF NOT EXISTS MEDICAID.REF.NUCC_STAGE;
+-- Snowsight: upload nucc_taxonomy_XXX.csv into NUCC_STAGE, then run:
+
+CREATE OR REPLACE TABLE MEDICAID.REF.NUCC_TAXONOMY
+USING TEMPLATE (
+  SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
+  FROM TABLE(
+    INFER_SCHEMA(
+      LOCATION    => '@MEDICAID.REF.NUCC_STAGE',
+      FILE_FORMAT => 'MEDICAID.REF.NPPES_CSV'   -- the same CSV rules work fine
+    )
+  )
+);
+
+COPY INTO MEDICAID.REF.NUCC_TAXONOMY
+FROM @MEDICAID.REF.NUCC_STAGE
+FILE_FORMAT = (FORMAT_NAME = 'MEDICAID.REF.NPPES_CSV')
+MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+ON_ERROR = CONTINUE;
+```
+
+### 8c. Join code → name into the final lookup
+
+```sql
+CREATE OR REPLACE TABLE MEDICAID.REF.NPI_TAXONOMY_NAMED AS
+SELECT n.npi,
+       n.specialty                                     AS specialty_code,   -- e.g. 207Q00000X
+       COALESCE(NULLIF(TRIM(t."Display Name"), ''),
+                t."Classification")                    AS specialty_name,   -- e.g. Family Medicine Physician
+       t."Classification"                              AS specialty_group   -- e.g. Family Medicine
+FROM MEDICAID.REF.NPI_TAXONOMY n
+LEFT JOIN MEDICAID.REF.NUCC_TAXONOMY t
+       ON n.specialty = t."Code";
+```
+
+**Why `LEFT JOIN`:** keeps every provider even if their code has no matching name (a retired code, or a blank specialty) — those get a blank name instead of being dropped.
+
+**Why the `COALESCE`:** a few codes have an empty "Display Name," so it falls back to the broader "Classification."
+
+---
+
+## 9️⃣ Step 9 — Final sanity checks
+
+**See the top specialties by provider count:**
+
+```sql
+SELECT specialty_name, COUNT(*) AS providers
+FROM MEDICAID.REF.NPI_TAXONOMY_NAMED
+GROUP BY specialty_name
+ORDER BY providers DESC
+LIMIT 15;
+```
+
+A healthy result looks like this (real names, smoothly descending counts):
+
+| specialty_name | providers |
+| --- | --- |
+| Behavior Technician | 562,584 |
+| *(null)* | 346,181 |
+| Clinical Social Worker | 345,870 |
+| Mental Health Counselor | 320,975 |
+| Pharmacist | 294,064 |
+| Physical Therapist | 292,501 |
+| Student in an Organized Health Care Education/Training Program | 286,211 |
+| Family Nurse Practitioner | 243,616 |
+| Speech-Language Pathologist | 212,223 |
+| Family Medicine Physician | 207,438 |
+
+> [!TIP]
+> **What "healthy" means:** real, well-formed names (no junk at the top); counts slope down smoothly (no single code swallowing everything); and the `null` group is small (~3–4%) — mostly deactivated or organizational NPIs, which is expected.
+
+---
+
+## 🔗 What's next — join to the claims data
+
+`NPI_TAXONOMY_NAMED` attaches a specialty to each **billing** provider in the claims table. That's what lets you build peer baselines **per code × specialty × year**.
+
+```sql
+-- Attach the specialty name to each claim's billing provider
+SELECT s.*,
+       t.specialty_code,
+       t.specialty_name
+FROM MEDICAID.RAW.MEDICAID_SPENDING s
+LEFT JOIN MEDICAID.REF.NPI_TAXONOMY_NAMED t
+       ON s.BILLING_PROVIDER_NPI_NUM = t.npi;
+```
+
+From here you group by specialty and compare each provider to their own peer group — using the **volume** measures (`TOTAL_CLAIM_LINES`, `TOTAL_PATIENTS`) as the reliable signals.
+
+---
+
+## 🔁 Refreshing next month
+
+NPPES publishes a new file every month. To reload with a fresh one, empty the table and clear the old files first:
+
+```sql
+TRUNCATE TABLE MEDICAID.REF.NPPES_RAW;   -- empty the table
+REMOVE @MEDICAID.REF.NPPES_STAGE;        -- clear the old staged parts
+```
+
+The schema, stage, and file format stay in place. Then repeat steps **2 → 4 → 6 → 7**, and re-run step **8c** to refresh the names.
+
+> [!TIP]
+> **Why `TRUNCATE` + `REMOVE` first?** If you skip this, `part.csv` from a test run and `part.csv.gz` from the real run count as **different files** to `COPY`, so rows get loaded twice. Clearing both guarantees a clean reload.
+
+---
+
+## 🧯 Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Rows missing / columns don't line up on parts 2+ | Header only in the first part | Put the header row in **every** split part |
+| First column looks like `NPI` but every join silently fails | UTF-8 **BOM** at the start of the file | `SKIP_BYTE_ORDER_MARK = TRUE` in the file format |
+| Splitting/gzipping is slow, or files get locked | Working inside a **OneDrive**-synced folder | Split in a local folder (e.g. `Downloads`) |
+| Snowflake won't auto-detect the archive | Used `Compress-Archive` (makes `.zip`) | Use **7-Zip → gzip** (`.gz`) |
+| Row counts **doubled** after a reload | `part.csv` and `part.csv.gz` are different names to `COPY` | `TRUNCATE` + `REMOVE` before reloading |
+| `Remove-Item … used by another process` | 7-Zip / antivirus / Explorer preview holds the file | Add `-Wait` to 7-Zip; retry the delete; exclude the folder from AV |
+| `COPY` seems to hang forever | No warehouse running | Start a warehouse — `COPY` needs compute |
+| Specialty names come back blank | Loaded the NUCC **Characteristics** file by mistake | Use the **Provider Taxonomy** CSV (`nucc_taxonomy_*.csv`) |
+| Upload rejected — file too big | A part is over the **250 MB** limit | Lower `$maxBytes` (e.g. `200MB`) and re-split |
+
+---
+
+## 📖 Glossary
+
+- **`DATABASE.SCHEMA.TABLE`** — a folder path. `MEDICAID` (database) → `REF` (schema/folder) → `NPPES_RAW` (table/file).
+- **`NPPES_RAW`** — the raw source, all 330 columns. Your backup.
+- **`NUCC_TAXONOMY`** — the code → name dictionary.
+- **`NPI_TAXONOMY_NAMED`** — the finished lookup you actually join to claims.
+- **NPI** — a provider's 10-digit national ID.
+- **Taxonomy / specialty code** — a 10-character code for a specialty (e.g. `207Q00000X` = Family Medicine).
+- **Primary Taxonomy Switch** — the `Y` flag marking a provider's main specialty among their 15 slots.
+- **Stage** — the upload area files sit in before loading.
+
+---
+
+## 🔗 Sources
+
+- **NPPES Data Dissemination (V.2):** `https://download.cms.gov/nppes/NPI_Files.html`
+- **NUCC Provider Taxonomy CSV:** `https://nucc.org/index.php/code-sets-mainmenu-41/provider-taxonomy-mainmenu-40/csv-mainmenu-57`
+
+---
+
+<div align="center">
+<sub>Name this file <code>README.md</code> and GitHub shows it as the repo front page automatically.</sub>
+</div>
