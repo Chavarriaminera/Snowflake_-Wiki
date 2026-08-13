@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/31035842/README.md)
 # Sign Language Video Ingestion Pipeline — Snowflake
 
 A **Snowflake-native ingestion pipeline** that loads WLASL sign language video data and its COCO-style annotations into queryable Delta-equivalent structures. Unstructured video is staged with a **directory table**; nested JSON metadata is flattened via **LATERAL FLATTEN**; the two are joined into a scoped evaluation set with verified ground-truth bounding boxes.
